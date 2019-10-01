@@ -17,6 +17,7 @@ import queue
 import threading
 import time
 import copy
+import json
 
 
 from joblib import Parallel, delayed
@@ -51,7 +52,7 @@ class Solution(np.ndarray):
         return {k : self[i] for i, k in enumerate(self.var_name)}     
     
     def __str__(self):
-        return self.to_dict()
+        return str(self.to_dict())
     
     
 class mipego(object):
@@ -64,7 +65,7 @@ class mipego(object):
                  n_init_sample=None, n_point=1, n_job=1, backend='multiprocessing',
                  n_restart=None, max_infill_eval=None, wait_iter=3, optimizer='MIES', 
                  log_file=None, data_file=None, verbose=False, random_seed=None,
-                 available_gpus=[]):
+                 available_gpus=[], warm_data_file=None):
         """
         parameter
         ---------
@@ -97,6 +98,8 @@ class mipego(object):
                                    'BFGS' (quasi-Newtion for GPR)
             available_gpus: array:
                 one dimensional array of GPU numbers to use for running on GPUs in parallel. Defaults to no gpus.
+            warm_data_file: str,
+                evaluated data to initialize the problem
 
         """
         self.verbose = verbose
@@ -191,6 +194,10 @@ class mipego(object):
         # paralellize gpus
         self.init_gpus = True
         self.evaluation_queue = queue.Queue()
+
+        # load initial data 
+        if warm_data_file is not None:
+           self._load_initial_data(warm_data_file)
     
     def _get_logger(self, logfile):
         """
@@ -228,6 +235,8 @@ class mipego(object):
         check for the duplicated solutions, as it is not allowed
         for noiseless objective functions
         """
+        if self.data is None or len(self.data) == 0:
+            return data
         ans = []
         X = np.array([s.tolist() for s in self.data], dtype='object')
         for i, x in enumerate(data):
@@ -238,6 +247,7 @@ class mipego(object):
             if not any(CON & INT & CAT):
                 ans.append(x)
         return ans
+
 
     def _eval_gpu(self, x, gpu=0, runs=1):
         """
@@ -425,12 +435,34 @@ class mipego(object):
     def _initialize(self):
         """Generate the initial data set (DOE) and construct the surrogate model
         """
+        self.data = []
+        if hasattr(self, 'warm_data'):
+            #TODO load the data
+            self.logger.info('adding warm data to the initial model')
+            self.data = copy.deepcopy(self.warm_data)
+
         self.logger.info('selected surrogate model: {}'.format(self.surrogate.__class__)) 
         self.logger.info('building the initial design of experiemnts...')
 
         samples = self._space.sampling(self.n_init_sample)
-        self.data = [Solution(s, index=k, var_name=self.var_names) for k, s in enumerate(samples)]
-        self.evaluate(self.data, runs=self.init_n_eval)
+        # self.data = [Solution(s, index=k, var_name=self.var_names) for k, s in enumerate(samples)]
+        # self.evaluate(self.data, runs=self.init_n_eval)
+
+        _data = []
+        while True:
+            _data = [Solution(s, index=k, var_name=self.var_names) for k, s in enumerate(samples)]
+            _data = self._remove_duplicate(_data)
+            if len(_data) < self.n_init_sample:
+                # Checking for duplicatates... and adding additional samples (if needed)
+                n_add_samples = self.n_init_sample - len(_data)
+                samples += self._space.sampling(n_add_samples)
+                self.logger.info('adding ' + str(n_add_samples) + ' more sample(s) to the initial design')
+            else:
+                break
+
+        self.evaluate(_data, runs=self.init_n_eval)
+        self.data += _data
+        self.logger.info('fitting the first model with ' + str(len(self.data)) + ' solutions')
         
         # set the initial incumbent
         fitness = np.array([s.fitness for s in self.data])
@@ -452,12 +484,13 @@ class mipego(object):
             self.logger.info('Evaluating:')
             self.logger.info(confs_.to_dict())
             confs_ = self._eval_gpu(confs_, gpu_no)[0] #will write the result to confs_
-
+            
             
             if self.data is None:
                 self.data = [confs_]
             else: 
                 self.data += [confs_]
+
             perf = np.array([s.fitness for s in self.data])
             #self.data.perf = pd.to_numeric(self.data.perf)
             #self.eval_count += 1
@@ -466,8 +499,10 @@ class mipego(object):
 
             self.logger.info("{} threads still running...".format(threading.active_count()))
 
+            # TODO: acamero commented this line... shall we do an eval_count instead?
             # model re-training
-            self.iter_count += 1
+            # self.iter_count += 1
+            self.eval_count += 1
             self.hist_f.append(self.incumbent.fitness)
 
             self.logger.info('iteration {} with current fitness {}, current incumbent is:'.format(self.iter_count, self.incumbent.fitness))
@@ -481,8 +516,12 @@ class mipego(object):
             #print "GPU no. {} is waiting for task on thread {}".format(gpu_no, gpu_no)
             if not self.check_stop():
                 self.logger.info('Data size is {}'.format(len(self.data)))
-                if len(self.data) >= self.n_init_sample:
+                threshold = self.n_init_sample if not hasattr(self, 'warm_data') else (len(self.warm_data) + self.n_init_sample)
+                #if len(self.data) >= self.n_init_sample:
+                if len(self.data) >= threshold:
                     self.fit_and_assess(surrogate = self.async_surrogates[gpu_no])
+                    #TODO: acamero commented this change... shall we count the iteratio here?
+                    self.iter_count += 1
                     while True:
                         try:
                             X, infill_value = self.arg_max_acquisition(surrogate = self.async_surrogates[gpu_no])
@@ -540,15 +579,30 @@ class mipego(object):
                 print("Not enough GPUs available for n_jobs")
                 return 1
 
+            self.data = None
+            if hasattr(self, 'warm_data'):
+                self.logger.info('adding warm data to the initial model')
+                self.data = copy.deepcopy(self.warm_data)
+
             self.n_point = 1 #set n_point to 1 because we only do one evaluation at a time (async)
             # initialize
             self.logger.info('selected surrogate model: {}'.format(self.surrogate.__class__)) 
             self.logger.info('building the initial design of experiemnts...')
 
             samples = self._space.sampling(self.n_init_sample)
-            datasamples = [Solution(s, index=k, var_name=self.var_names) for k, s in enumerate(samples)]
-            self.data = None
+            # datasamples = [Solution(s, index=k, var_name=self.var_names) for k, s in enumerate(samples)]
+            # self.data = None
 
+            while True:
+                datasamples = [Solution(s, index=k, var_name=self.var_names) for k, s in enumerate(samples)]
+                datasamples = self._remove_duplicate(datasamples)
+                if len(datasamples) < self.n_init_sample:
+                    # Checking for duplicatates... and adding additional samples (if needed)
+                    n_add_samples = self.n_init_sample - len(datasamples)
+                    samples += self._space.sampling(n_add_samples)
+                    self.logger.info('adding ' + str(n_add_samples) + ' more sample(s) to the initial design')
+                else:
+                    break
 
             for i in range(self.n_init_sample):
                 self.evaluation_queue.put(datasamples[i])
@@ -727,3 +781,33 @@ class mipego(object):
 
         if np.isinf(self.max_eval) and np.isinf(self.max_iter):
             raise ValueError('max_eval and max_iter cannot be both infinite')
+
+    def _load_initial_data(self, filename):
+        data_points = []
+        try:
+            with open(filename, 'r') as f:
+                f_str = f.read()
+                data_points = json.loads(f_str)
+            f.close()
+        except IOError:
+            print('Unable to load the configuration file')
+
+        if len(data_points) == 0:
+            raise Exception('The warm data file is not valid')
+
+        var_name = list(data_points[0].keys())
+        if 'fitness' not in var_name:
+            raise Exception('Please provide a fitness value for the initial data')
+
+        if 'fitness' in var_name: var_name.remove('fitness')
+        if 'n_eval' in var_name: var_name.remove('n_eval')
+        if 'index' in var_name: var_name.remove('index')
+        if 'var_name' in var_name: var_name.remove('var_name')
+        
+        self.warm_data = []
+        for index, dp in enumerate(data_points):
+            n_eval = dp['n_eval'] if 'n_eval' in dp else 1
+            self.warm_data.append(Solution([dp[x] for x in var_name],
+                                           fitness=dp['fitness'], n_eval=n_eval, 
+                                           index=index, var_name=var_name))
+        self.logger.info(str(len(self.warm_data)) + ' initial solutions loaded')
